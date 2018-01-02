@@ -1,11 +1,11 @@
 # -*- coding: utf-8 -*-
-
-from odoo import _, api, fields, models
+from odoo import api, fields, models
 from odoo.exceptions import UserError
 from datetime import datetime, timedelta, date
 from lxml import etree
 from lxml.etree import Element, SubElement
 from odoo import SUPERUSER_ID
+from odoo.tools.translate import _
 
 import logging
 _logger = logging.getLogger(__name__)
@@ -184,29 +184,22 @@ class AccountInvoiceTax(models.Model):
             for line in tax.invoice_id.invoice_line_ids:
                 if tax.tax_id in line.invoice_line_tax_ids and tax.tax_id.price_include:
                     price_tax_included += line.price_tax_included
-            if price_tax_included > 0 and  tax.tax_id.sii_type in ["R"]:
+            if price_tax_included > 0 and  tax.tax_id.sii_type in ["R"] and tax.tax_id.amount > 0:
                 base = round(price_tax_included)
-            elif price_tax_included > 0:
+            elif price_tax_included > 0 and tax.tax_id.amount > 0:
                 base = round(price_tax_included / ( 1 + tax.tax_id.amount / 100.0))
             neto += base
         return neto
 
-    def _compute_base_amount(self):
-        included = False
-        for tax in self:
-            if tax.tax_id.price_include:
-                included = True
-        if included:
-            neto = self._getNeto()
-            tax.base = neto
-        else:
-            super(AccountInvoiceTax, self)._compute_base_amount()
-
-    amount_retencion = fields.Monetary(string="Retención",
-        default=0.00,)
-    retencion_account_id = fields.Many2one('account.account',
-       string='Tax Account',
-       domain=[('deprecated', '=', False)])
+    amount_retencion = fields.Monetary(
+            string="Retención",
+            default=0.00,
+        )
+    retencion_account_id = fields.Many2one(
+            'account.account',
+            string='Tax Account',
+            domain=[('deprecated', '=', False)],
+        )
 
 
 class Referencias(models.Model):
@@ -237,9 +230,7 @@ class AccountInvoice(models.Model):
         return default
 
     def _domain_journal_document_class_id(self):
-        domain = []
-        for rec in self:
-            domain = rec._get_available_journal_document_class()
+        domain = self._get_available_journal_document_class()
         return [('id', 'in', domain)]
 
     turn_issuer = fields.Many2one(
@@ -251,29 +242,26 @@ class AccountInvoice(models.Model):
         states={'draft': [('readonly', False)]},
         )
     vat_discriminated = fields.Boolean(
-        'Discriminate VAT?',
-        compute="get_vat_discriminated",
-        store=True,
-        readonly=False,
-        help="Discriminate VAT on Quotations and Sale Orders?")
-    available_journals = fields.Many2one(
-        'account.journal',
-    #    compute='_get_available_journal_document_class',
-        string='Available Journals')
+            'Discriminate VAT?',
+            compute="get_vat_discriminated",
+            store=True,
+            readonly=False,
+            help="Discriminate VAT on Quotations and Sale Orders?",
+        )
     available_journal_document_class_ids = fields.Many2many(
-        'account.journal.sii_document_class',
-    #    compute='_get_available_journal_document_class',
-        string='Available Journal Document Classes')
-    supplier_invoice_number = fields.Char(
-        copy=False)
+            'account.journal.sii_document_class',
+            #    compute='_get_available_journal_document_class',
+            string='Available Journal Document Classes',
+        )
     journal_document_class_id = fields.Many2one(
-        'account.journal.sii_document_class',
-        'Documents Type',
-        default=_default_journal_document_class_id,
-        domain=_domain_journal_document_class_id,
-        readonly=True,
-        store=True,
-        states={'draft': [('readonly', False)]})
+            'account.journal.sii_document_class',
+            string='Documents Type',
+            default=lambda self: self._default_journal_document_class_id(),
+            domain=_domain_journal_document_class_id,
+            readonly=True,
+            store=True,
+            states={'draft': [('readonly', False)]},
+        )
     sii_document_class_id = fields.Many2one(
         'sii.document_class',
         related='journal_document_class_id.sii_document_class_id',
@@ -305,7 +293,8 @@ class AccountInvoice(models.Model):
                     ('9','Otros.')
             ],
             string="Código No recuperable",
-            readonly=True, states={'draft': [('readonly', False)]},
+            readonly=True,
+            states={'draft': [('readonly', False)]},
         )# @TODO select 1 automático si es emisor 2Categoría
 
     document_number = fields.Char(
@@ -460,31 +449,24 @@ class AccountInvoice(models.Model):
             related="partner_id.activity_description",
             readonly=True,
     )
-    global_discount = fields.Float(
-            string="Descuento Global",
-            default=0.00,
-            readonly=True,
-            states={'draft': [('readonly', False)]},
-        )
-    global_discount_type = fields.Selection(
-            [
-                ('amount','Monto'),
-                ('percent','Porcentaje'),
-            ],
-            string="Tipo de descuento",
-            readonly=True,
-            states={'draft': [('readonly', False)]},
-        )
-    global_discount_detail = fields.Char(
-            string="Razón del descuento",
-            readonly=True,
-            states={'draft': [('readonly', False)]},
-        )
     amount_untaxed_global_discount = fields.Float(
             string="Global Discount Amount",
             store=True,
             default=0.00,
             compute='_compute_amount',
+        )
+    amount_untaxed_global_recargo = fields.Float(
+            string="Global Recargo Amount",
+            store=True,
+            default=0.00,
+            compute='_compute_amount',
+        )
+    global_descuentos_recargos = fields.One2many(
+            'account.invoice.gdr',
+            'invoice_id',
+            string="Descuentos / Recargos globales",
+            readonly=True,
+            states={'draft': [('readonly', False)]},
         )
 
     def _repairDiff(self, move_lines, dif):#usualmente es de 1 $ cuando se aplica descuentoo es valor iva incluido
@@ -519,14 +501,7 @@ class AccountInvoice(models.Model):
 
     def _gd_move_lines(self, move_lines):
         new_lines = []
-        discount = self.global_discount
-        if self.global_discount_type == 'amount':
-            afecto = 0
-            for line in self.invoice_line_ids:
-                for t in line.invoice_line_tax_ids:
-                    if t.amount > 0:
-                        afecto += line.price_subtotal
-            discount = ((self.global_discount * 100) / afecto )
+        gdr = self.porcentaje_dr()
         hold = False
         total = 0
         for line in move_lines:
@@ -535,10 +510,10 @@ class AccountInvoice(models.Model):
                     for t in line[2]['tax_ids']:
                         imp = self.env['account.tax'].browse(t[1])
                         if imp.amount > 0  and line[2]['debit'] > 0:
-                            line[2]['debit'] -= int(round((line[2]['debit'] * (discount / 100))))
+                            line[2]['debit'] = int(round((line[2]['debit'] * gdr)))
                             total += line[2]['debit']
                         elif imp.amount > 0:
-                            line[2]['credit'] -= int(round((line[2]['credit'] * (discount /100))))
+                            line[2]['credit'] = int(round((line[2]['credit'] * gdr)))
                             total += line[2]['credit']
                         elif line[2]['debit'] > 0:
                             total += line[2]['debit']
@@ -562,7 +537,7 @@ class AccountInvoice(models.Model):
 
     @api.multi
     def finalize_invoice_move_lines(self, move_lines):
-        if self.global_discount > 0:
+        if self.global_descuentos_recargos:
             move_lines = self._gd_move_lines(move_lines)
         taxes = self.tax_line_move_line_get()
         retencion = 0
@@ -582,49 +557,16 @@ class AccountInvoice(models.Model):
             move_lines = self._repairDiff( move_lines, dif)
         return move_lines
 
-    #@TODO Mejorar
-    def _compute_global_discount(self):
-        taxes_grouped = self.get_taxes_values()
-        tax_lines = self.tax_line_ids.browse([])
-        for tax in taxes_grouped.values():
-            tax_lines += tax_lines.new(tax)
-        self.tax_line_ids = tax_lines
-        discount = self.global_discount
-        amount_untaxed = round(sum(line.price_subtotal for line in self.invoice_line_ids))
-        afecto = 0
-        for line in self.invoice_line_ids:
-            for t in line.invoice_line_tax_ids:
-                if t.amount > 0:
-                    afecto += line.price_subtotal
-        if self.global_discount_type in ['amount'] and afecto > 0:
-            discount = ((self.global_discount * 100) / afecto )
-        self.amount_untaxed = amount_untaxed
-        if afecto > 0 and discount > 0:
-            self.amount_untaxed_global_discount = (afecto * (discount / 100))
-        amount_untaxed -= round(self.amount_untaxed_global_discount)
-        amount_tax = sum(line.amount for line in self.tax_line_ids)
-        self.amount_tax = amount_tax
-        amount_total = amount_untaxed + amount_tax
-        amount_total_company_signed = amount_total
-        self.amount_total = amount_total
-        amount_untaxed_signed = amount_untaxed
-        if self.currency_id and self.currency_id != self.company_id.currency_id:
-            amount_total_company_signed = self.currency_id.compute(amount_total, self.company_id.currency_id)
-            amount_untaxed_signed = self.currency_id.compute(amount_untaxed, self.company_id.currency_id)
-        sign = self.type in ['in_refund', 'out_refund'] and -1 or 1
-        self.amount_total_company_signed = amount_total_company_signed * sign
-        self.amount_total_signed = amount_total * sign
-        self.amount_untaxed_signed = amount_untaxed_signed * sign
-
     @api.depends('invoice_line_ids.price_subtotal', 'tax_line_ids.amount', 'tax_line_ids.amount_rounding',
-                 'currency_id', 'company_id', 'date_invoice', 'type')
-    @api.onchange('global_discount','global_discount_type')
+                 'currency_id', 'company_id', 'date_invoice', 'type','global_descuentos_recargos')
     def _compute_amount(self):
         for inv in self:
-            #@TODO Mejorar
-            if inv.global_discount > 0  and inv.global_discount_type:
-                inv._compute_global_discount()
-                continue
+            neto = 0
+            if inv.global_descuentos_recargos:
+                neto = inv.global_descuentos_recargos.get_monto_aplicar()
+                agrupados = inv.global_descuentos_recargos.get_agrupados()
+                inv.amount_untaxed_global_discount = agrupados['D']
+                inv.amount_untaxed_global_recargo = agrupados['R']
             amount_tax = 0
             amount_retencion = 0
             included = False
@@ -635,10 +577,10 @@ class AccountInvoice(models.Model):
                 amount_retencion  += tax.amount_retencion
             inv.amount_retencion = amount_retencion
             if included:
-                neto = inv.tax_line_ids._getNeto()
+                neto += inv.tax_line_ids._getNeto()
                 amount_retencion  += amount_retencion
             else:
-                neto = sum(line.price_subtotal for line in inv.invoice_line_ids)
+                neto += sum(line.price_subtotal for line in inv.invoice_line_ids)
             inv.amount_untaxed = neto
             inv.amount_tax = amount_tax
             inv.amount_total = inv.amount_untaxed + inv.amount_tax - amount_retencion
@@ -702,47 +644,125 @@ class AccountInvoice(models.Model):
                     })
         return res
 
+    def porcentaje_dr(self):
+        taxes = super(AccountInvoice,self).get_taxes_values()
+        afecto = 0.00
+        exento = 0.00
+        porcentaje = 0.00
+        total = 0.00
+        for id, t in taxes.items():
+            tax = self.env['account.tax'].browse(t['tax_id'])
+            total += t['base']
+            if tax.amount > 0:
+                afecto += t['base']
+            else:
+                exento += t['base']
+        agrupados = self.global_descuentos_recargos.get_agrupados()
+        monto = agrupados['R'] - agrupados['D']
+        if monto == 0:
+            return 0.00
+        porcentaje = (100.0 * monto) / afecto
+        return  1 + (porcentaje /100.0)
+
+    def _get_grouped_taxes(self, line, taxes,tax_grouped={}):
+        for tax in taxes:
+            val = self._prepare_tax_line_vals(line, tax)
+            # If the taxes generate moves on the same financial account as the invoice line,
+            # propagate the analytic account from the invoice line to the tax line.
+            # This is necessary in situations were (part of) the taxes cannot be reclaimed,
+            # to ensure the tax move is allocated to the proper analytic account.
+            if not val.get('account_analytic_id') and line.account_analytic_id and val['account_id'] == line.account_id.id:
+                val['account_analytic_id'] = line.account_analytic_id.id
+            key = self.env['account.tax'].browse(tax['id']).get_grouping_key(val)
+            if key not in tax_grouped:
+                tax_grouped[key] = val
+            else:
+                tax_grouped[key]['amount'] += val['amount']
+                tax_grouped[key]['amount_retencion'] += val['amount_retencion']
+                tax_grouped[key]['base'] += val['base']
+        return tax_grouped
+
     @api.multi
     def get_taxes_values(self):
         tax_grouped = {}
+        totales = {}
         for line in self.invoice_line_ids:
+            if line.invoice_line_tax_ids[0].price_include:# se asume todos losproductos vienen con precio incluido o no ( no hay mixes)
+                for t in line.invoice_line_tax_ids:
+                    if not t in totales:
+                        totales[t] = 0
+                    total[t] += (round(line.price_unit *line.quantity) * line.discount)
+                continue
             taxes = line.invoice_line_tax_ids.compute_all(line.price_unit, self.currency_id, line.quantity, line.product_id, self.partner_id, discount=line.discount)['taxes']
-            for tax in taxes:
-                val = self._prepare_tax_line_vals(line, tax)
-                # If the taxes generate moves on the same financial account as the invoice line,
-                # propagate the analytic account from the invoice line to the tax line.
-                # This is necessary in situations were (part of) the taxes cannot be reclaimed,
-                # to ensure the tax move is allocated to the proper analytic account.
-                if not val.get('account_analytic_id') and line.account_analytic_id and val['account_id'] == line.account_id.id:
-                    val['account_analytic_id'] = line.account_analytic_id.id
-                key = self.env['account.tax'].browse(tax['id']).get_grouping_key(val)
-                if key not in tax_grouped:
-                    tax_grouped[key] = val
-                else:
-                    tax_grouped[key]['amount'] += val['amount']
-                    tax_grouped[key]['amount_retencion'] += val['amount_retencion']
-                    tax_grouped[key]['base'] += val['base']
-        if self.global_discount > 0:
-            discount = self.global_discount
-            if self.global_discount_type in ['amount']:
-                discount = 0
-                afecto = 0
-                for line in self.invoice_line_ids:
-                    for tl in line.invoice_line_tax_ids:
-                        if tl.amount > 0:
-                            afecto += line.price_subtotal
-                if afecto > 0:
-                    discount = ((self.global_discount * 100) / afecto )
-            taxes = tax_grouped
-            tax_grouped = {}
-            for id, t in taxes.items():
-                tax = self.env['account.tax'].browse(t['tax_id'])
-                if tax.amount > 0 and discount > 0:
-                    base = round(round(t['base']) * (1 - ((discount / 100.0) or 0.0)))
-                    t['base'] = base
-                    t['amount'] = tax._compute_amount(base, base, 1)
-                tax_grouped[id] = t
-        return tax_grouped
+            tax_grouped = self._get_grouped_taxes(line, taxes, tax_grouped)
+        if totales:
+            for line in self.invoice_line_ids:
+                for t in line.invoice_line_tax_ids:
+                    taxes = t.compute_all(totales[t], self.currency_id, 1)['taxes']
+                    taxes_grouped = self._get_grouped_taxes(line, taxes, tax_grouped)
+        if not self.global_descuentos_recargos:
+            return tax_grouped
+        gdr = self.porcentaje_dr()
+        taxes = {}
+        for t, group in tax_grouped.items():
+            if t not in taxes:
+                taxes[t] = group
+            tax = self.env['account.tax'].browse(group['tax_id'])
+            if tax.amount > 0:
+                taxes[t]['amount'] *= gdr
+                taxes[t]['base'] *=  gdr
+        return taxes
+
+    @api.model
+    def _prepare_refund(self, invoice, date_invoice=None, date=None, description=None, journal_id=None, tipo_nota=61, mode='1'):
+        values = super(AccountInvoice, self)._prepare_refund(invoice, date_invoice, date, description, journal_id)
+        document_type = self.env['account.journal.sii_document_class'].search(
+                [
+                    ('sii_document_class_id.sii_code','=', tipo_nota),
+                    ('journal_id','=', invoice.journal_id.id),
+                ],
+                limit=1,
+            )
+        if invoice.type == 'out_invoice':
+            type = 'out_refund'
+        elif invoice.type == 'out_refund':
+            type = 'out_invoice'
+        elif invoice.type == 'in_invoice':
+            type = 'in_refund'
+        elif invoice.type == 'in_refund':
+            type = 'in_invoice'
+        values.update({
+                'type': type,
+                'journal_document_class_id': document_type.id,
+                'turn_issuer': invoice.turn_issuer.id,
+                'referencias':[[0,0, {
+                        'origen': int(invoice.sii_document_number or invoice.reference),
+                        'sii_referencia_TpoDocRef': invoice.sii_document_class_id.id,
+                        'sii_referencia_CodRef': mode,
+                        'motivo': description,
+                        'fecha_documento': invoice.date_invoice
+                    }]],
+            })
+        return values
+
+    @api.multi
+    @api.returns('self')
+    def refund(self, date_invoice=None, date=None, description=None, journal_id=None, tipo_nota=61, mode='1'):
+        new_invoices = self.browse()
+        for invoice in self:
+            # create the new invoice
+            values = self._prepare_refund(invoice, date_invoice=date_invoice, date=date,
+                                    description=description, journal_id=journal_id,
+                                    tipo_nota=tipo_nota, mode=mode)
+            refund_invoice = self.create(values)
+            invoice_type = {'out_invoice': ('customer invoices credit note'),
+                            'out_refund': ('customer invoices debit note'),
+                            'in_invoice': ('vendor bill credit note'),
+                            'in_refund': ('vendor bill debit note')}
+            message = _("This %s has been created from: <a href=# data-oe-model=account.invoice data-oe-id=%d>%s</a>") % (invoice_type[invoice.type], invoice.id, invoice.number)
+            refund_invoice.message_post(body=message)
+            new_invoices += refund_invoice
+        return new_invoices
 
     def get_document_class_default(self, document_classes):
         document_class_id = None
@@ -870,37 +890,39 @@ class AccountInvoice(models.Model):
             line.invoice_line_tax_ids = tax_ids
 
     def _get_available_journal_document_class(self):
-        invoice_type = self.type
+        context = dict(self._context or {})
+        journal_id = self.journal_id or context.get('default_journal_id', self.env['account.journal'].search([('type','=','sale')],limit=1))
+        invoice_type = self.type or context.get('default_type', False)
+        if not invoice_type:
+            invoice_type = 'in_invoice' if journal_id.type == 'purchase' else 'out_invoice'
         document_class_ids = []
-        document_class_id = False
         nd = False
         for ref in self.referencias:
             if not nd:
                 nd = ref.sii_referencia_CodRef
-        #self.available_journal_document_class_ids = self.env[
-        #    'account.journal.sii_document_class']
-        if invoice_type in [
-                'out_invoice', 'in_invoice', 'out_refund', 'in_refund']:
-            operation_type = self.get_operation_type(invoice_type)
-
-            if self.use_documents:
+        if invoice_type in ['out_invoice', 'in_invoice', 'out_refund', 'in_refund']:
+            if journal_id:
                 domain = [
-                    ('journal_id', '=', self.journal_id.id),
-                     ]
-                if invoice_type  in [ 'in_refund', 'out_refund']:
-                    domain += [('sii_document_class_id.document_type','in',['credit_note'] )]
-                else:
-                    options = ['invoice', 'invoice_in']
-                    if nd:
-                        options.append('debit_note')
-                    domain += [('sii_document_class_id.document_type','in', options )]
-                document_classes = self.env[
-                    'account.journal.sii_document_class'].search(domain)
-                document_class_ids = document_classes.ids
-                    # If not specific document type found, we choose another one
+                    ('journal_id', '=', journal_id.id),
+                 ]
+            else:
+                operation_type = self.get_operation_type(invoice_type)
+                domain = [
+                    ('journal_id.type', '=', operation_type),
+                 ]
+            if invoice_type  in [ 'in_refund', 'out_refund']:
+                domain += [('sii_document_class_id.document_type','in',['credit_note'] )]
+            else:
+                options = ['invoice', 'invoice_in']
+                if nd:
+                    options.append('debit_note')
+                domain += [('sii_document_class_id.document_type','in', options )]
+            document_classes = self.env[
+                'account.journal.sii_document_class'].search(domain)
+            document_class_ids = document_classes.ids
         return document_class_ids
 
-    @api.onchange('journal_id')
+    @api.onchange('journal_id', 'partner_id')
     def update_domain_journal(self):
         document_classes = self._get_available_journal_document_class()
         result = {'domain':{
@@ -931,10 +953,7 @@ class AccountInvoice(models.Model):
 
     @api.onchange('sii_document_class_id')
     def _check_vat(self):
-        boleta_ids = [
-            self.env.ref('l10n_cl_fe.dc_bzf_f_dtn').id,
-            self.env.ref('l10n_cl_fe.dc_b_f_dtm').id]
-        if self.sii_document_class_id not in boleta_ids and self.partner_id.document_number == '' or self.partner_id.document_number == '0':
+        if not self._es_boleta() and not self.partner_id.commercial_partner_id.document_number:
             raise UserError(_("""The customer/supplier does not have a VAT \
 defined. The type of invoicing document you selected requires you tu settle \
 a VAT."""))
@@ -1356,7 +1375,7 @@ version="1.0">
         sig_root.append(etree.fromstring(signed_info_c14n))
         signature_value = SubElement(sig_root, "SignatureValue")
         key = crypto.load_privatekey(type_,privkey.encode('ascii'))
-        signature= crypto.sign(key,signed_info_c14n,'sha1')
+        signature = crypto.sign(key,signed_info_c14n,'sha1')
         signature_value.text =textwrap.fill(base64.b64encode(signature).decode(),64)
         key_info = SubElement(sig_root, "KeyInfo")
         key_value = SubElement(key_info, "KeyValue")
@@ -1438,18 +1457,18 @@ version="1.0">
     def send_xml_file(self, envio_dte=None, file_name="envio", company_id=False, sii_result='NoEnviado', doc_ids='', post='/cgi_dte/UPL/DTEUpload'):
         if not company_id.dte_service_provider:
             raise UserError(_("Not Service provider selected!"))
-        #try:
-        signature_d = self.get_digital_signature_pem(
-            company_id)
-        seed = self.get_seed(company_id)
-        template_string = self.create_template_seed(seed)
-        seed_firmado = self.sign_seed(
-            template_string, signature_d['priv_key'],
-            signature_d['cert'])
-        token = self.get_token(seed_firmado,company_id)
-        #except:
-        #    _logger.info('error')
-        #    return
+        try:
+            signature_d = self.get_digital_signature_pem(
+                company_id)
+            seed = self.get_seed(company_id)
+            template_string = self.create_template_seed(seed)
+            seed_firmado = self.sign_seed(
+                template_string, signature_d['priv_key'],
+                signature_d['cert'])
+            token = self.get_token(seed_firmado,company_id)
+        except:
+            _logger.warning('error')
+            return
 
         url = 'https://palena.sii.cl'
         if company_id.dte_service_provider == 'SIICERT':
@@ -1507,9 +1526,8 @@ version="1.0">
                     if envio:
                         self.sii_xml_dte = etree.tostring(envio.findall("{http://www.sii.cl/SiiDte}DTE")[0])
                 self.crear_intercambio()
-        filename = (self.document_number+'.xml').replace(' ','')
-        url_path = '/web/binary/download_document_exchange?model=account.invoice\
-    &field=sii_xml_exchange&id=%s&filename=%s' % (self.id, filename)
+        url_path = '/download/xml/invoice/%s' % (self.id)
+        filename = ('%s.xml' % self.document_number).replace(' ','_')
         att = self.env['ir.attachment'].search([('name','=', filename), ('res_id','=', self.id), ('res_model','=','account.invoice')], limit=1)
         if att:
             return att
@@ -1563,9 +1581,7 @@ version="1.0">
 
     @api.multi
     def get_xml_file(self):
-        filename = (self.document_number+'.xml').replace(' ','')
-        url_path = '/web/binary/download_document?model=account.invoice\
-&field=sii_xml_request&id=%s&filename=%s' % (self.id, filename)
+        url_path = '/download/xml/invoice/%s' % (self.id)
         return {
             'type' : 'ir.actions.act_url',
             'url': url_path,
@@ -1574,9 +1590,7 @@ version="1.0">
 
     @api.multi
     def get_xml_exchange_file(self):
-        filename = (self.document_number+'.xml').replace(' ','')
-        url_path = '/web/binary/download_document?model=account.invoice\
-&field=sii_xml_exchange&id=%s&filename=%s' % (self.id, filename)
+        url_path = '/download/xml/invoice_exchange/%s' % (self.id)
         return {
             'type' : 'ir.actions.act_url',
             'url': url_path,
@@ -1909,19 +1923,22 @@ version="1.0">
         lin_dr = 1
         dr_line = {}
         dr_line = collections.OrderedDict()
-        dr_line['NroLinDR'] = lin_dr
-        dr_line['TpoMov'] = 'D'
-        if self.global_discount_detail:
-            dr_line['GlosaDR'] = self.global_discount_detail
-        disc_type = "%"
-        if self.global_discount_type == "amount":
-            disc_type = "$"
-        dr_line['TpoValor'] = disc_type
-        dr_line['ValorDR'] = round(self.global_discount,2)
-        if self.sii_document_class_id.sii_code in [34] and (self.referencias and self.referencias[0].sii_referencia_TpoDocRef.sii_code == '34'):#solamente si es exento
-            dr_line['IndExeDR'] = 1
-        dr_lines= [{'DscRcgGlobal':dr_line}]
-        return dr_lines
+        for dr in self.global_descuentos_recargos:
+            dr_line['NroLinDR'] = lin_dr
+            dr_line['TpoMov'] = dr.type
+            if dr.gdr_dtail:
+                dr_line['GlosaDR'] = dr.gdr_dtail
+            disc_type = "%"
+            if dr.gdr_type == "amount":
+                disc_type = "$"
+            dr_line['TpoValor'] = disc_type
+            dr_line['ValorDR'] = round(dr.global_discount,2)
+            if self.sii_document_class_id.sii_code in [34] and (self.referencias and self.referencias[0].sii_referencia_TpoDocRef.sii_code == '34'):#solamente si es exento
+                dr_line['IndExeDR'] = 1
+            dr_lines= [{'DscRcgGlobal':dr_line}]
+            result.append( dr_lines )
+            lin_dr += 1
+        return result
 
     def _dte(self, n_atencion=None):
         dte = collections.OrderedDict()
@@ -1958,10 +1975,9 @@ version="1.0">
                 ref_lines.extend([{'Referencia':ref_line}])
                 lin_ref += 1
         dte['item'] = invoice_lines['invoice_lines']
-
+        if self.global_descuentos_recargos:
+            dte['drlines'] = self._gd()
         dte['reflines'] = ref_lines
-        if self.global_discount > 0:
-            result['drlines'] = self._gd()
         dte['TEDd'] = self.get_barcode(invoice_lines['no_product'])
         return dte
 
@@ -2315,19 +2331,18 @@ version="1.0">
         self.ensure_one()
         self.sent = True
         if self.ticket:
-            return self.env['report'].get_action(self, 'l10n_cl_fe.report_ticket')
-        return self.env['report'].get_action(self, 'account.report_invoice')
+            return self.env.ref('l10n_cl_fe.action_print_ticket').report_action(self)
+        return self.env.ref('account.account_invoices').report_action(self)
 
     @api.multi
     def print_cedible(self):
         """ Print Cedible
         """
-        return self.env['report'].get_action(self, 'l10n_cl_fe.invoice_cedible')
+        return self.env.ref('l10n_cl_fe.action_print_cedible').report_action(self)
 
     @api.multi
     def getTotalDiscount(self):
         total_discount = 0
         for l in self.invoice_line_ids:
             total_discount +=  (((l.discount or 0.00) /100) * l.price_unit * l.quantity)
-        _logger.info(total_discount)
         return self.currency_id.round(total_discount)

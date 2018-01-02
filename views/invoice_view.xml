@@ -1,6 +1,30 @@
 <?xml version="1.0" encoding="utf-8"?>
 <odoo>
     <data>
+      <record id="view_invoice_tax_tree" model="ir.ui.view">
+          <field name="name">account.invoice.tax.sii.tree</field>
+          <field name="model">account.invoice.tax</field>
+          <field name="inherit_id" ref="account.view_invoice_tax_tree" />
+          <field name="arch" type="xml">
+              <field name="base" position="after">
+                  <field name="amount_retencion" />
+                  <field name='retencion_account_id' />
+              </field>
+          </field>
+      </record>
+
+      <record id="view_invoice_tax_form" model="ir.ui.view">
+          <field name="name">account.invoice.tax.sii.tree</field>
+          <field name="model">account.invoice.tax</field>
+          <field name="inherit_id" ref="account.view_invoice_tax_form" />
+          <field name="arch" type="xml">
+              <field name="base" position="after">
+                  <field name="amount_retencion" />
+                  <field name='retencion_account_id' />
+              </field>
+          </field>
+      </record>
+
       <record id="view_account_invoice_filter" model="ir.ui.view">
           <field name="name">l10n_cl.invoice.search</field>
           <field name="model">account.invoice</field>
@@ -47,6 +71,7 @@
             <field name="inherit_id" ref="account.invoice_form" />
             <field name="arch" type="xml">
               <form>
+                  <field name="sii_document_class_id" invisible="1"/>
                   <field name="available_journal_document_class_ids" invisible="1"/>
                   <field name="use_documents" invisible="1"/>
                   <field name="sii_document_number" invisible="1"/>
@@ -89,19 +114,27 @@
                 <field name="forma_pago" />
                 <field name="contact_id" domain="[('parent_id','=',partner_id)]" />
               </field>
-              
+
               <field name="partner_bank_id" position="before">
                   <field name="vat_discriminated"/>
               </field>
 
-              <field name="payment_term_id" position="after">
-                <field name="global_discount" />
-                <field name="global_discount_type" attrs="{'required':[('global_discount','>',0)], 'invisible':[('global_discount','==',0)]}" />
-                <field name="global_discount_detail" attrs="{'required':[('global_discount','>',0)], 'invisible':[('global_discount','==',0)]}" />
-              </field>
-
               <field name="amount_untaxed" position="after">
                 <field name="amount_untaxed_global_discount" widget="monetary" attrs="{'invisible':[('amount_untaxed_global_discount','=',0)]}"/>
+                <field name="amount_untaxed_global_recargo" widget="monetary" attrs="{'invisible':[('amount_untaxed_global_recargo','=',0)]}"/>
+              </field>
+
+              <field name="comment" position="after">
+                <field name="global_descuentos_recargos" widget="one2many_list" mode="tree" context="{'default_invoice_id': id}">
+                  <tree string="Descuetos / Recargos Globales" editable="bottom">
+                    <field name="type"/>
+                    <field name="gdr_type"/>
+                    <field name="valor"/>
+                    <field name="gdr_dtail"/>
+                    <field name="amount_untaxed_global_dr" invisible="1"/>
+                    <field name="invoice_id" invisible="1"/>
+                  </tree>
+                </field>
               </field>
 
               <xpath expr="//page/field[@name='tax_line_ids']/tree/field[@name='account_id']" position="after">
@@ -213,17 +246,28 @@
                 <button name="%(account.action_account_invoice_refund)d" type='action' string='Ask Refund' groups="account.group_account_invoice" attrs="{'invisible': ['|',('type', '=', 'in_invoice'),('state','not in',('open','paid'))]}"/>
               </field>
 
-              <field name="payment_term_id" position="after">
-                <field name="global_discount" />
-                <field name="global_discount_type" attrs="{'required':[('global_discount','>',0)], 'invisible':[('global_discount','==',0)]}" />
-                <field name="global_discount_detail" attrs="{'required':[('global_discount','>',0)], 'invisible':[('global_discount','==',0)]}" />
-              </field>
               <field name="amount_untaxed" position="after">
                 <field name="amount_untaxed_global_discount" widget="monetary" attrs="{'invisible':[('amount_untaxed_global_discount','=',0)]}"/>
+                <field name="amount_untaxed_global_recargo" widget="monetary" attrs="{'invisible':[('amount_untaxed_global_recargo','=',0)]}"/>
               </field>
+
+              <field name="comment" position="after">
+                  <field name="global_descuentos_recargos" widget="one2many_list" mode="tree" context="{'default_invoice_id': id}">
+                    <tree string="Descuetos / Recargos Globales" editable="bottom">
+                      <field name="type"/>
+                      <field name="gdr_type"/>
+                      <field name="valor"/>
+                      <field name="gdr_dtail"/>
+                      <field name="amount_untaxed_global_dr" invisible="1"/>
+                      <field name="invoice_id" invisible="1"/>
+                    </tree>
+                  </field>
+              </field>
+
               <field name="number" position="attributes">
                   <attribute name="invisible">1</attribute>
               </field>
+
               <field name="number" position="after">
                   <field name="document_number" class="oe_inline"/>
               </field>
@@ -309,5 +353,39 @@
                 </notebook>
             </field>
         </record>
+
+        <record id="action_invoice_tree1" model="ir.actions.act_window">
+            <field name="name">Todos los documentos de ventas (Para Certificación)</field>
+            <field name="res_model">account.invoice</field>
+            <field name="view_type">form</field>
+            <field name="view_mode">tree,kanban,form,calendar,pivot,graph</field>
+            <field eval="False" name="view_id"/>
+            <field name="domain">[('type','in',('out_invoice','out_refund'))]</field>
+            <field name="context">{'type':'out_invoice', 'journal_type': 'sale'}</field>
+            <field name="search_view_id" ref="account.view_account_invoice_filter_inherit_invoices"/>
+            <field name="help" type="html">
+              <p class="oe_view_nocontent_create">
+                Click to create a customer invoice.
+              </p><p>
+                Odoo's electronic invoicing allows to ease and fasten the
+                collection of customer payments. Your customer receives the
+                invoice by email and he can pay online and/or import it
+                in his own system.
+              </p><p>
+                The discussions with your customer are automatically displayed at
+                the bottom of each invoice.
+              </p>
+            </field>
+        </record>
+
+
+        <record id="action_invoice_tree1_view1" model="ir.actions.act_window.view">
+            <field eval="1" name="sequence"/>
+            <field name="view_mode">tree</field>
+            <field name="view_id" ref="invoice_tree"/>
+            <field name="act_window_id" ref="action_invoice_tree1"/>
+        </record>
+
+        <menuitem action="action_invoice_tree1" id="menu_action_invoice_tree1" parent="menu_sii_config" sequence="1"/>
     </data>
 </odoo>
