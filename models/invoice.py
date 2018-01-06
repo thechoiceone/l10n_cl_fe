@@ -85,7 +85,7 @@ except ImportError:
     _logger.warning('Cannot import cchardet library')
 
 try:
-    from signxml import xmldsig, methods
+    from signxml import XMLSigner, methods
 except ImportError:
     _logger.warning('Cannot import signxml')
 
@@ -263,12 +263,13 @@ class AccountInvoice(models.Model):
             states={'draft': [('readonly', False)]},
         )
     sii_document_class_id = fields.Many2one(
-        'sii.document_class',
-        related='journal_document_class_id.sii_document_class_id',
-        string='Document Type',
-        copy=False,
-        readonly=True,
-        store=True)
+            'sii.document_class',
+            related='journal_document_class_id.sii_document_class_id',
+            string='Document Type',
+            copy=False,
+            readonly=True,
+            store=True,
+        )
     sii_document_number = fields.Char(
         string='Document Number',
         copy=False,
@@ -687,11 +688,11 @@ class AccountInvoice(models.Model):
         tax_grouped = {}
         totales = {}
         for line in self.invoice_line_ids:
-            if line.invoice_line_tax_ids[0].price_include:# se asume todos losproductos vienen con precio incluido o no ( no hay mixes)
+            if line.invoice_line_tax_ids and line.invoice_line_tax_ids[0].price_include:# se asume todos losproductos vienen con precio incluido o no ( no hay mixes)
                 for t in line.invoice_line_tax_ids:
                     if not t in totales:
                         totales[t] = 0
-                    total[t] += (round(line.price_unit *line.quantity) * line.discount)
+                    totales[t] += (round(line.price_unit *line.quantity) * line.discount)
                 continue
             taxes = line.invoice_line_tax_ids.compute_all(line.price_unit, self.currency_id, line.quantity, line.product_id, self.partner_id, discount=line.discount)['taxes']
             tax_grouped = self._get_grouped_taxes(line, taxes, tax_grouped)
@@ -891,7 +892,11 @@ class AccountInvoice(models.Model):
 
     def _get_available_journal_document_class(self):
         context = dict(self._context or {})
-        journal_id = self.journal_id or context.get('default_journal_id', self.env['account.journal'].search([('type','=','sale')],limit=1))
+        journal_id = self.journal_id
+        if not journal_id and 'default_journal_id' in context:
+            journal_id = self.env['account.journal'].browse(context['default_journal_id'])
+        if not journal_id:
+            journal_id = self.env['account.journal'].search([('type','=','sale')],limit=1)
         invoice_type = self.type or context.get('default_type', False)
         if not invoice_type:
             invoice_type = 'in_invoice' if journal_id.type == 'purchase' else 'out_invoice'
@@ -951,9 +956,9 @@ class AccountInvoice(models.Model):
                 ).id
             self.journal_document_class_id = self._default_journal_document_class_id(default)
 
-    @api.onchange('sii_document_class_id')
+    @api.onchange('sii_document_class_id', 'partner_id')
     def _check_vat(self):
-        if not self._es_boleta() and not self.partner_id.commercial_partner_id.document_number:
+        if self.partner_id and not self._es_boleta() and not self.partner_id.commercial_partner_id.document_number:
             raise UserError(_("""The customer/supplier does not have a VAT \
 defined. The type of invoicing document you selected requires you tu settle \
 a VAT."""))
@@ -982,28 +987,22 @@ a VAT."""))
                 document_number = inv.number
             inv.document_number = document_number
 
-    @api.constrains('supplier_invoice_number', 'partner_id', 'company_id')
-    def _check_reference(self):
-        for inv in self:
-            if inv.type in ['out_invoice', 'out_refund'] and inv.reference and inv.state == 'open':
-                domain = [
-                            ('type', 'in', ('out_invoice', 'out_refund')),
-                              # ('reference', '=', self.reference),
-                              ('document_number', '=', inv.document_number),
-                              ('journal_document_class_id.sii_document_class_id', '=', inv.journal_document_class_id.sii_document_class_id.id),
-                              ('company_id', '=', inv.company_id.id),
-                              ('id', '!=', inv.id),
-                        ]
-                invoice_ids = inv.search(domain)
-                if invoice_ids:
-                    raise UserError(
-                        _('Supplier Invoice Number must be unique per Supplier and Company!'))
-
-    _sql_constraints = [
-        ('number_supplier_invoice_number',
-            'unique(supplier_invoice_number, partner_id, company_id)',
-         'Supplier Invoice Number must be unique per Supplier and Company!'),
-    ]
+    @api.one
+    @api.constrains('reference', 'partner_id', 'company_id', 'type','journal_document_class_id')
+    def _check_reference_in_invoice(self):
+        if self.type in ['in_invoice', 'in_refund'] and self.reference:
+            domain = [('type', '=', self.type),
+                      ('reference', '=', self.reference),
+                      ('partner_id', '=', self.partner_id.id),
+                      ('journal_document_class_id.sii_document_class_id', '=',
+                       self.journal_document_class_id.sii_document_class_id.id),
+                      ('company_id', '=', self.company_id.id),
+                      ('id', '!=', self.id)]
+            invoice_ids = self.search(domain)
+            if invoice_ids:
+                raise UserError(u'El numero de factura debe ser unico por Proveedor.\n'\
+                                u'Ya existe otro documento con el numero: %s para el proveedor: %s' %
+                                (self.reference, self.partner_id.display_name))
 
     @api.multi
     def action_move_create(self):
@@ -1012,14 +1011,14 @@ a VAT."""))
             if obj_inv.journal_document_class_id and not obj_inv.sii_document_number:
                 if invtype in ('out_invoice', 'out_refund'):
                     if not obj_inv.journal_document_class_id.sequence_id:
-                        raise osv.except_osv(_('Error!'), _(
+                        raise UserError(_(
                             'Please define sequence on the journal related documents to this invoice.'))
                     sii_document_number = obj_inv.journal_document_class_id.sequence_id.next_by_id()
                     prefix = obj_inv.journal_document_class_id.sii_document_class_id.doc_code_prefix or ''
                     move_name = (prefix + str(sii_document_number)).replace(' ','')
                     obj_inv.write({'move_name': move_name})
                 elif invtype in ('in_invoice', 'in_refund'):
-                    sii_document_number = obj_inv.supplier_invoice_number
+                    sii_document_number = obj_inv.reference
         super(AccountInvoice, self).action_move_create()
         for obj_inv in self:
             invtype = obj_inv.type
@@ -1117,7 +1116,8 @@ a VAT."""))
                                                 'model':'account.invoice',
                                                 'user_id':self.env.user.id,
                                                 'tipo_trabajo': 'pasivo',
-                                                'date_time': (datetime.now() + timedelta(hours=12)),
+                                                'date_time': (datetime.now() + timedelta(hours=self.env['ir.config_parameter'].sudo().get_param('account.auto_send_dte', default=12))),
+                                                'send_email': False if inv.company_id.dte_service_provider=='SIICERT' or self.env['ir.config_parameter'].sudo().get_param('account.auto_send_email', default=True) else True
                                                 })
             if inv.purchase_to_done:
                 for ptd in inv.purchase_to_done:
@@ -1285,11 +1285,8 @@ version="1.0">
 
     def sign_seed(self, message, privkey, cert):
         doc = etree.fromstring(message)
-        signed_node = xmldsig(
-            doc, digest_algorithm=u'sha1').sign(
-            method=methods.enveloped, algorithm=u'rsa-sha1',
-            key=privkey.encode('ascii'),
-            cert=cert)
+        signed_node = XMLSigner(method=methods.enveloped, digest_algorithm='sha1').sign(
+            doc, key=privkey.encode('ascii'), cert=cert)
         msg = etree.tostring(
             signed_node, pretty_print=True).decode().replace('ds:', '')
         return msg
@@ -1531,7 +1528,7 @@ version="1.0">
         att = self.env['ir.attachment'].search([('name','=', filename), ('res_id','=', self.id), ('res_model','=','account.invoice')], limit=1)
         if att:
             return att
-        data = base64.b64encode(self.sii_xml_exchange)
+        data = base64.b64encode(self.sii_xml_exchange.encode('ISO-8859-1'))
         values = dict(
                         name=filename,
                         datas_fname=filename,
@@ -1716,10 +1713,10 @@ version="1.0">
         Emisor= collections.OrderedDict()
         Emisor['RUTEmisor'] = self.format_vat(self.company_id.vat)
         if self._es_boleta():
-            Emisor['RznSocEmisor'] = self.company_id.partner_id.name
+            Emisor['RznSocEmisor'] = self._acortar_str(self.company_id.partner_id.name, 100)
             Emisor['GiroEmisor'] = self._acortar_str(self.company_id.activity_description.name, 80)
         else:
-            Emisor['RznSoc'] = self.company_id.partner_id.name
+            Emisor['RznSoc'] = self._acortar_str(self.company_id.partner_id.name, 100)
             Emisor['GiroEmis'] = self._acortar_str(self.company_id.activity_description.name, 80)
             if self.company_id.phone:
                 Emisor['Telefono'] = self._acortar_str(self.company_id.phone, 20)
@@ -1749,8 +1746,14 @@ version="1.0">
             Receptor['Contacto'] = self._acortar_str(self.partner_id.phone or self.commercial_partner_id.phone or self.partner_id.email, 80)
         if (self.commercial_partner_id.email or self.commercial_partner_id.dte_email or self.partner_id.email or self.partner_id.dte_email) and not self._es_boleta():
             Receptor['CorreoRecep'] = self.commercial_partner_id.dte_email or self.partner_id.dte_email or self.commercial_partner_id.email or self.partner_id.email
-        Receptor['DirRecep'] = self._acortar_str((self.partner_id.street or self.commercial_partner_id.street) + ' ' + (self.partner_id.street2 or self.commercial_partner_id.street2 or ''),70)
+        street_recep = (self.partner_id.street or self.commercial_partner_id.street or False)
+        if not street_recep:
+            raise UserError('Debe Ingresar dirección del cliente')
+        street2_recep = (self.partner_id.street2 or self.commercial_partner_id.street2 or False)
+        Receptor['DirRecep'] = self._acortar_str(street_recep + (' ' + street2_recep if street2_recep else ''), 70)
         Receptor['CmnaRecep'] = self.partner_id.city_id.name or self.commercial_partner_id.city_id.name
+        if not Receptor['CmnaRecep']:
+            raise UserError('Debe Ingresar Comuna del cliente')
         Receptor['CiudadRecep'] = self.partner_id.city or self.commercial_partner_id.city
         return Receptor
 
@@ -1932,7 +1935,7 @@ version="1.0">
             if dr.gdr_type == "amount":
                 disc_type = "$"
             dr_line['TpoValor'] = disc_type
-            dr_line['ValorDR'] = round(dr.global_discount,2)
+            dr_line['ValorDR'] = round(dr.value, 2)
             if self.sii_document_class_id.sii_code in [34] and (self.referencias and self.referencias[0].sii_referencia_TpoDocRef.sii_code == '34'):#solamente si es exento
                 dr_line['IndExeDR'] = 1
             dr_lines= [{'DscRcgGlobal':dr_line}]
@@ -1963,7 +1966,7 @@ version="1.0">
                 ref_line['NroLinRef'] = lin_ref
                 if not self._es_boleta():
                     if  ref.sii_referencia_TpoDocRef:
-                        ref_line['TpoDocRef'] = ref.sii_referencia_TpoDocRef.sii_code
+                        ref_line['TpoDocRef'] = ref.sii_referencia_TpoDocRef.doc_code_prefix if ref.sii_referencia_TpoDocRef.document_type == 'other_document' else ref.sii_referencia_TpoDocRef.sii_code
                         ref_line['FolioRef'] = ref.origen
                     ref_line['FchRef'] = ref.fecha_documento or datetime.strftime(datetime.now(), '%Y-%m-%d')
                 if ref.sii_referencia_CodRef not in ['','none', False]:
@@ -2090,7 +2093,7 @@ version="1.0">
             NroDte = 0
             for documento in classes:
                 if documento['sii_batch_number'] in dtes.keys():
-                    raise UserErro("No se puede repetir el mismo número de orden")
+                    raise UserError("No se puede repetir el mismo número de orden")
                 dtes.update({str(documento['sii_batch_number']): documento['envio']})
                 NroDte += 1
                 file_name += 'F' + str(int(documento['sii_document_number'])) + 'T' + str(id_class_doc)
